@@ -1,0 +1,6 @@
+{
+  "source": "octodemo/Magero-ApprovedScaffolds",
+  "fetched_at": null,
+  "note": "Populated once per run by scripts/fetch-scaffolds.sh. Committed empty so an audit still runs - with the scaffold checks reported NOT-ASSESSED - when the scaffolds repo is unreachable.",
+  "scaffolds": []
+}

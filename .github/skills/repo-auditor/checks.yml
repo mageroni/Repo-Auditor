@@ -1,0 +1,802 @@
+# Repo Auditor - check catalogue
+#
+# This file is the single source of truth for what the auditor checks.
+# SKILL.md describes *how* to run an audit; this file describes *what* is audited.
+# Adding or retuning a rule should only require editing this file.
+#
+# Each check has:
+#   id          - stable identifier, referenced in reports and caches. Never reuse an id.
+#   pillar      - which of the six audit pillars it belongs to
+#   title       - short human-readable name
+#   class       - deterministic | heuristic | deep     (see SKILL.md "Check classification")
+#   tier        - 1 | 2 | 3                            (see SKILL.md "Tiering")
+#   severity    - critical | high | medium | low
+#   gate        - true when a FAIL blocks the overall repo verdict
+#   detector    - how the result is computed (see "Detector types" below)
+#   remediation - the action item emitted when the check does not pass
+#
+# Detector types
+# --------------
+#   paths_any:      passes when the repo file list matches ANY of the given globs.
+#   paths_all:      passes when the repo file list matches ALL of the given globs.
+#   paths_none:     passes when the repo file list matches NONE of the given globs.
+#   field:          passes when a field on the evidence record satisfies `op`/`value`.
+#   content_any:    passes when ANY of the given regexes match one of the sampled files.
+#   search:         org-scoped code search; `query` is run ONCE for the whole org and the
+#                   result set is joined back to repos by name (tier 2).
+#   manual:         requires a human or an LLM reading source (tier 3, never auto-FAIL).
+#   unavailable:    the data needed is not reachable with the granted permissions.
+#                   Always reported NOT-ASSESSED; see `requires` for what would unblock it.
+#
+# Glob matching is case-insensitive and evaluated against repository-root-relative paths.
+
+version: 1
+
+# Files sampled (fetched in full) for content_any detectors. Keep this list short:
+# every entry costs one extra API call on repos where the file exists.
+content_samples:
+  - package.json
+  - pom.xml
+  - pyproject.toml
+  - go.mod
+  - Dockerfile
+
+checks:
+
+  # ---------------------------------------------------------------- Pillar 1
+  - id: "1.1"
+    pillar: scaffold
+    title: Approved scaffold fingerprint present
+    class: deterministic
+    tier: 1
+    severity: medium
+    gate: false
+    detector:
+      type: paths_any
+      globs:
+        - .scaffold
+        - .scaffold.*
+        - .template
+        - .template.*
+        - .github/scaffold.yml
+        - .github/copilot-setup-steps.yml
+      note: >-
+        A fingerprint only proves the repo claims a scaffold. Mapping the claim to the
+        approved list is done by scripts/collect.sh against references/approved-scaffolds.json,
+        which is fetched once per run - never once per repo.
+    remediation: Regenerate from an approved scaffold or add scaffold provenance metadata.
+
+  - id: "1.2"
+    pillar: scaffold
+    title: Declared scaffold is on the approved list
+    class: deterministic
+    tier: 1
+    severity: high
+    gate: false
+    detector:
+      type: field
+      field: scaffold.approved
+      op: is_true
+      note: Resolved by collect.sh; NOT-ASSESSED when no fingerprint was found (see 1.1).
+    remediation: Migrate to an approved scaffold from octodemo/Magero-ApprovedScaffolds.
+
+  # ---------------------------------------------------------------- Pillar 2
+  - id: "2.1"
+    pillar: standards
+    title: Single responsibility per module
+    class: deep
+    tier: 3
+    severity: low
+    gate: false
+    detector:
+      type: manual
+      guidance: Requires reading module boundaries and the README scope statement.
+    remediation: Split multi-purpose modules into single-responsibility services.
+
+  - id: "2.2"
+    pillar: standards
+    title: API-first design (OpenAPI/AsyncAPI spec present)
+    class: deterministic
+    tier: 1
+    severity: medium
+    gate: false
+    detector:
+      type: paths_any
+      globs:
+        - "**/openapi.y*ml"
+        - "**/openapi.json"
+        - "**/asyncapi.y*ml"
+        - "**/swagger.y*ml"
+        - "**/swagger.json"
+        - api/**/*.y*ml
+    remediation: Add an OpenAPI or AsyncAPI specification under /api or /docs.
+
+  - id: "2.3"
+    pillar: standards
+    title: Versioning strategy (changelog or semver tags)
+    class: deterministic
+    tier: 1
+    severity: low
+    gate: false
+    detector:
+      type: any_of
+      detectors:
+        - type: paths_any
+          globs: [CHANGELOG.md, CHANGELOG, VERSION]
+        - type: field
+          field: has_semver_tag
+          op: is_true
+    remediation: Adopt semantic versioning with tags and maintain a CHANGELOG.md.
+
+  - id: "2.4"
+    pillar: standards
+    title: Code quality gates in CI
+    class: heuristic
+    tier: 2
+    severity: medium
+    gate: false
+    detector:
+      type: content_any
+      files: [".github/workflows/*.y*ml", "Jenkinsfile", ".gitlab-ci.yml"]
+      patterns:
+        - "(?i)\\b(lint|eslint|ruff|flake8|checkstyle|spotless)\\b"
+        - "(?i)\\b(sonar|codeql|semgrep|checkmarx)\\b"
+        - "(?i)\\b(coverage|jacoco|codecov)\\b"
+      min_matches: 2
+    remediation: Add lint, static-analysis and coverage gates to the CI pipeline.
+
+  - id: "2.5"
+    pillar: standards
+    title: Dependencies pinned via lock file
+    class: deterministic
+    tier: 1
+    severity: medium
+    gate: false
+    detector:
+      type: paths_any
+      globs:
+        - package-lock.json
+        - yarn.lock
+        - pnpm-lock.yaml
+        - Pipfile.lock
+        - poetry.lock
+        - uv.lock
+        - requirements*.txt
+        - go.sum
+        - Gemfile.lock
+        - Cargo.lock
+        - gradle.lockfile
+        - "**/packages.lock.json"
+    remediation: Commit a dependency lock file so builds are reproducible.
+
+  - id: "2.6"
+    pillar: standards
+    title: No hardcoded credentials
+    class: heuristic
+    tier: 2
+    severity: critical
+    gate: false
+    detector:
+      type: search
+      query: '/(password|passwd|secret|api_key|apikey|token)\s*[:=]\s*["'']\w{8,}/'
+      polarity: negative
+      note: >-
+        A search hit is evidence of a possible leak, not proof. Report as WARN and route to
+        secret scanning for confirmation; never auto-FAIL on a regex hit alone.
+    remediation: Move the credential to a secrets manager and rotate it.
+
+  - id: "2.7"
+    pillar: standards
+    title: Observability hooks (logging/metrics/tracing)
+    class: heuristic
+    tier: 2
+    severity: medium
+    gate: false
+    detector:
+      type: search
+      query: "opentelemetry OR micrometer OR prom-client OR structlog OR logback"
+      polarity: positive
+    remediation: Wire structured logging, metrics and trace propagation.
+
+  - id: "2.8"
+    pillar: standards
+    title: 12-factor config separation
+    class: deterministic
+    tier: 1
+    severity: low
+    gate: false
+    detector:
+      type: any_of
+      detectors:
+        - type: paths_any
+          globs: [".env.example", ".env.sample", ".env.template"]
+        - type: paths_none
+          globs: [".env"]
+    remediation: Externalise configuration and commit a .env.example instead of a .env.
+
+  - id: "2.9"
+    pillar: standards
+    title: Automated tests present
+    class: deterministic
+    tier: 1
+    severity: high
+    gate: false
+    detector:
+      type: paths_any
+      globs:
+        - test/**
+        - tests/**
+        - "**/__tests__/**"
+        - "**/*_test.go"
+        - "**/*_test.py"
+        - "**/test_*.py"
+        - "**/*.test.*"
+        - "**/*.spec.*"
+        - src/test/**
+    remediation: Add unit and integration tests.
+
+  - id: "2.10"
+    pillar: standards
+    title: Default branch protected
+    class: deterministic
+    tier: 1
+    severity: high
+    gate: false
+    detector:
+      type: unavailable
+      requires: "administration: read (repo settings / branch protection API)"
+      fallback_detector:
+        type: paths_any
+        globs: [CODEOWNERS, .github/CODEOWNERS, docs/CODEOWNERS]
+        note: CODEOWNERS only implies review intent; it does not prove branch protection.
+    remediation: Enable branch protection requiring pull requests and review on the default branch.
+
+  # ---------------------------------------------------------------- Pillar 3
+  # Pillar 3 is the gating pillar and is evaluated FIRST. See SKILL.md "Early exit".
+  - id: "3.1"
+    pillar: mandatory_files
+    title: License file present and non-empty
+    class: deterministic
+    tier: 1
+    severity: critical
+    gate: true
+    detector:
+      type: paths_any
+      globs: [LICENSE, LICENSE.*, License.MD, LICENCE, LICENCE.*]
+      min_size_bytes: 1
+    remediation: Add a License file at the repository root.
+
+  - id: "3.2"
+    pillar: mandatory_files
+    title: Bancolombia.MD present and non-empty
+    class: deterministic
+    tier: 1
+    severity: critical
+    gate: true
+    detector:
+      type: paths_any
+      globs: [Bancolombia.MD, Bancolombia.md, BANCOLOMBIA.md, bancolombia.md]
+      min_size_bytes: 1
+    remediation: Add Bancolombia.MD declaring ownership, terms and contact information.
+
+  - id: "3.3"
+    pillar: mandatory_files
+    title: README present
+    class: deterministic
+    tier: 1
+    severity: medium
+    gate: false
+    detector:
+      type: paths_any
+      globs: [README.md, README, README.rst, readme.md]
+      min_size_bytes: 1
+    remediation: Add a README describing purpose, setup and usage.
+
+  - id: "3.4"
+    pillar: mandatory_files
+    title: CONTRIBUTING guidelines present
+    class: deterministic
+    tier: 1
+    severity: low
+    gate: false
+    detector:
+      type: paths_any
+      globs: [CONTRIBUTING.md, .github/CONTRIBUTING.md, docs/CONTRIBUTING.md]
+    remediation: Add CONTRIBUTING.md.
+
+  - id: "3.5"
+    pillar: mandatory_files
+    title: SECURITY policy present
+    class: deterministic
+    tier: 1
+    severity: medium
+    gate: false
+    detector:
+      type: paths_any
+      globs: [SECURITY.md, .github/SECURITY.md, docs/SECURITY.md]
+    remediation: Add SECURITY.md with vulnerability reporting instructions.
+
+  - id: "3.6"
+    pillar: mandatory_files
+    title: CODEOWNERS present
+    class: deterministic
+    tier: 1
+    severity: medium
+    gate: false
+    detector:
+      type: paths_any
+      globs: [CODEOWNERS, .github/CODEOWNERS, docs/CODEOWNERS]
+    remediation: Add CODEOWNERS mapping each path to an owning team.
+
+  - id: "3.7"
+    pillar: mandatory_files
+    title: CHANGELOG present
+    class: deterministic
+    tier: 1
+    severity: low
+    gate: false
+    detector:
+      type: paths_any
+      globs: [CHANGELOG.md, CHANGELOG, docs/CHANGELOG.md]
+    remediation: Add CHANGELOG.md.
+
+  # ---------------------------------------------------------------- Pillar 4
+  - id: "4.1"
+    pillar: architecture
+    title: Hexagonal / clean architecture separation
+    class: deep
+    tier: 3
+    severity: medium
+    gate: false
+    detector:
+      type: manual
+      guidance: >-
+        A domain/ directory is weak evidence; real assessment requires checking that the
+        domain layer has no infrastructure imports.
+      hint_detector:
+        type: paths_any
+        globs: ["**/domain/**", "**/application/**", "**/infrastructure/**"]
+    remediation: Decouple business logic from infrastructure concerns.
+
+  - id: "4.2"
+    pillar: architecture
+    title: Event-driven communication
+    class: heuristic
+    tier: 2
+    severity: low
+    gate: false
+    detector:
+      type: search
+      query: "kafka OR sns OR sqs OR eventbridge OR rabbitmq"
+      polarity: positive
+    remediation: Use asynchronous events for inter-service communication where appropriate.
+
+  - id: "4.3"
+    pillar: architecture
+    title: Stateless services
+    class: deep
+    tier: 3
+    severity: medium
+    gate: false
+    detector:
+      type: manual
+      guidance: Requires confirming no in-process session state is retained between requests.
+    remediation: Externalise session state to a shared cache or datastore.
+
+  - id: "4.4"
+    pillar: architecture
+    title: Container-first packaging
+    class: deterministic
+    tier: 1
+    severity: medium
+    gate: false
+    detector:
+      type: paths_any
+      globs: [Dockerfile, "**/Dockerfile", Containerfile, "**/Containerfile"]
+    remediation: Package the service as an OCI container image with a multi-stage build.
+
+  - id: "4.5"
+    pillar: architecture
+    title: Infrastructure as Code
+    class: deterministic
+    tier: 1
+    severity: medium
+    gate: false
+    detector:
+      type: paths_any
+      globs:
+        - "**/*.tf"
+        - "**/*.tfvars"
+        - "**/cloudformation/**"
+        - "**/template.y*ml"
+        - "**/cdk.json"
+        - "**/Pulumi.y*ml"
+        - "**/*.bicep"
+        - "**/helm/**"
+        - "**/chart.y*ml"
+    remediation: Define all cloud resources as code.
+
+  - id: "4.6"
+    pillar: architecture
+    title: API Gateway / BFF pattern
+    class: deep
+    tier: 3
+    severity: low
+    gate: false
+    detector:
+      type: manual
+      guidance: Requires reading architecture documentation for the ingress topology.
+    remediation: Document the gateway/BFF layer fronting external APIs.
+
+  - id: "4.7"
+    pillar: architecture
+    title: Database per service
+    class: deep
+    tier: 3
+    severity: medium
+    gate: false
+    detector:
+      type: manual
+      guidance: Requires comparing connection targets across services; not repo-local.
+    remediation: Give each service its own datastore or schema.
+
+  - id: "4.8"
+    pillar: architecture
+    title: Circuit breaker and retry policies
+    class: heuristic
+    tier: 2
+    severity: medium
+    gate: false
+    detector:
+      type: search
+      query: "resilience4j OR polly OR circuitbreaker OR hystrix OR tenacity"
+      polarity: positive
+    remediation: Add circuit breaker and retry policies around external calls.
+
+  - id: "4.9"
+    pillar: architecture
+    title: Health check endpoint
+    class: heuristic
+    tier: 2
+    severity: medium
+    gate: false
+    detector:
+      type: search
+      query: '"/health" OR "/actuator/health" OR "/healthz" OR "/readyz"'
+      polarity: positive
+    remediation: Expose a health/readiness endpoint.
+
+  - id: "4.10"
+    pillar: architecture
+    title: Graceful shutdown
+    class: heuristic
+    tier: 2
+    severity: low
+    gate: false
+    detector:
+      type: search
+      query: "SIGTERM OR gracefulShutdown OR graceful_shutdown"
+      polarity: positive
+    remediation: Handle SIGTERM and drain in-flight requests before exiting.
+
+  # ---------------------------------------------------------------- Pillar 5
+  - id: "5.1"
+    pillar: security
+    title: TLS on all communication paths
+    class: heuristic
+    tier: 2
+    severity: critical
+    gate: true
+    detector:
+      type: search
+      query: '/http:\/\/(?!localhost|127\.0\.0\.1|0\.0\.0\.0|schemas?\.|www\.w3\.org|xmlns)/'
+      polarity: negative
+      note: >-
+        Primary Bancolombia requirement. Plaintext endpoints in documentation or test
+        fixtures are WARN, not FAIL - the path must be checked before escalating.
+    remediation: Enforce TLS >= 1.2 on every outbound endpoint; remove plaintext http:// targets.
+
+  - id: "5.2"
+    pillar: security
+    title: Authentication and authorization
+    class: heuristic
+    tier: 2
+    severity: critical
+    gate: true
+    detector:
+      type: search
+      query: "oauth OR oidc OR jwt OR mtls OR authorization"
+      polarity: positive
+    remediation: Adopt OAuth 2.0/OIDC externally and mTLS or JWT internally.
+
+  - id: "5.3"
+    pillar: security
+    title: Input validation
+    class: deep
+    tier: 3
+    severity: critical
+    gate: true
+    detector:
+      type: manual
+      guidance: Requires tracing external inputs to their validation boundary.
+      note: >-
+        Gate check with class `deep`. In bulk mode this is NOT-ASSESSED and does NOT block
+        the gate; it is only enforced for repos escalated to tier 3.
+    remediation: Validate and sanitise all external inputs at the boundary.
+
+  - id: "5.4"
+    pillar: security
+    title: OWASP Top 10 mitigations / SAST in CI
+    class: heuristic
+    tier: 2
+    severity: critical
+    gate: true
+    detector:
+      type: content_any
+      files: [".github/workflows/*.y*ml", "Jenkinsfile", ".gitlab-ci.yml"]
+      patterns:
+        - "(?i)\\b(codeql|semgrep|sonar|checkmarx|fortify|bandit|brakeman)\\b"
+    remediation: Add a SAST scan to the CI pipeline.
+
+  - id: "5.5"
+    pillar: security
+    title: Dependency vulnerability scanning (SCA)
+    class: heuristic
+    tier: 2
+    severity: critical
+    gate: true
+    detector:
+      type: content_any
+      files: [".github/workflows/*.y*ml", "Jenkinsfile", ".gitlab-ci.yml"]
+      patterns:
+        - "(?i)\\b(npm audit|dependency-check|snyk|trivy|grype|osv-scanner|dependency-review)\\b"
+    remediation: Add a software-composition-analysis scan to CI.
+
+  - id: "5.6"
+    pillar: security
+    title: Container image scanning
+    class: heuristic
+    tier: 2
+    severity: high
+    gate: false
+    detector:
+      type: content_any
+      files: [".github/workflows/*.y*ml", "Jenkinsfile", ".gitlab-ci.yml"]
+      patterns:
+        - "(?i)\\b(trivy|grype|clair|ecr scan|scan-on-push)\\b"
+      applies_when: "4.4"
+      note: Only applicable to repos that produce a container image (check 4.4 passes).
+    remediation: Scan container images for CVEs before deployment.
+
+  - id: "5.7"
+    pillar: security
+    title: Secret scanning enabled
+    class: deterministic
+    tier: 1
+    severity: high
+    gate: false
+    detector:
+      type: unavailable
+      requires: "administration: read (security_and_analysis on the repository object)"
+      fallback_detector:
+        type: content_any
+        files: [".github/workflows/*.y*ml"]
+        patterns: ["(?i)\\b(trufflehog|gitleaks|detect-secrets)\\b"]
+        note: Detects in-pipeline scanning only; platform secret scanning is not visible.
+    remediation: Enable GitHub secret scanning and push protection org-wide.
+
+  - id: "5.8"
+    pillar: security
+    title: Least privilege in IAM policies
+    class: heuristic
+    tier: 2
+    severity: high
+    gate: false
+    detector:
+      type: search
+      query: '"Action": "*" OR "Resource": "*"'
+      polarity: negative
+      applies_when: "4.5"
+    remediation: Replace wildcard IAM actions and resources with explicit grants.
+
+  - id: "5.9"
+    pillar: security
+    title: Encryption at rest
+    class: heuristic
+    tier: 2
+    severity: high
+    gate: false
+    detector:
+      type: search
+      query: "kms_key_id OR server_side_encryption OR encrypted"
+      polarity: positive
+      applies_when: "4.5"
+    remediation: Encrypt data at rest using managed keys.
+
+  - id: "5.10"
+    pillar: security
+    title: Audit logging of security events
+    class: deep
+    tier: 3
+    severity: medium
+    gate: false
+    detector:
+      type: manual
+      guidance: Requires confirming auth and data-access paths emit audit records.
+    remediation: Log authentication, privilege escalation and data-access events.
+
+  - id: "5.11"
+    pillar: security
+    title: CORS policy restricted
+    class: heuristic
+    tier: 2
+    severity: high
+    gate: false
+    detector:
+      type: search
+      query: '"Access-Control-Allow-Origin: *" OR "origin: \"*\"" OR "cors({origin:\"*\"})"'
+      polarity: negative
+    remediation: Restrict CORS to a known origin allowlist.
+
+  - id: "5.12"
+    pillar: security
+    title: Content Security Policy headers
+    class: heuristic
+    tier: 2
+    severity: medium
+    gate: false
+    detector:
+      type: search
+      query: "Content-Security-Policy OR helmet"
+      polarity: positive
+      applies_when: web_service
+    remediation: Set a Content Security Policy on web responses.
+
+  # ---------------------------------------------------------------- Pillar 6
+  - id: "6.1"
+    pillar: operations
+    title: CI/CD pipeline exists
+    class: deterministic
+    tier: 1
+    severity: high
+    gate: false
+    detector:
+      type: paths_any
+      globs:
+        - .github/workflows/*.y*ml
+        - Jenkinsfile
+        - .gitlab-ci.yml
+        - azure-pipelines.yml
+        - .circleci/config.yml
+        - bitbucket-pipelines.yml
+    remediation: Add an automated build/test/deploy pipeline.
+
+  - id: "6.2"
+    pillar: operations
+    title: Environment parity
+    class: deterministic
+    tier: 1
+    severity: low
+    gate: false
+    detector:
+      type: paths_any
+      globs:
+        - "**/environments/**"
+        - "**/overlays/**"
+        - "**/*.dev.*"
+        - "**/*.staging.*"
+        - "**/*.prod.*"
+    remediation: Define dev/staging/prod consistently through IaC workspaces or overlays.
+
+  - id: "6.3"
+    pillar: operations
+    title: Runbook / operations guide
+    class: deterministic
+    tier: 1
+    severity: medium
+    gate: false
+    detector:
+      type: paths_any
+      globs: ["**/runbook*.md", OPERATIONS.md, "docs/operations*.md", "**/RUNBOOK*"]
+    remediation: Document routine operational procedures in a runbook.
+
+  - id: "6.4"
+    pillar: operations
+    title: SLO/SLA definitions
+    class: deterministic
+    tier: 1
+    severity: medium
+    gate: false
+    detector:
+      type: paths_any
+      globs: ["**/slo*.md", "**/sla*.md", SERVICE_LEVEL.md, "**/slo*.y*ml"]
+    remediation: Document service level objectives and error budgets.
+
+  - id: "6.5"
+    pillar: operations
+    title: Alerting and on-call
+    class: heuristic
+    tier: 2
+    severity: medium
+    gate: false
+    detector:
+      type: search
+      query: "alertmanager OR prometheusrule OR cloudwatch_metric_alarm OR pagerduty"
+      polarity: positive
+    remediation: Configure alerts and document the on-call rotation.
+
+  - id: "6.6"
+    pillar: operations
+    title: Incident management process
+    class: deterministic
+    tier: 1
+    severity: low
+    gate: false
+    detector:
+      type: paths_any
+      globs: ["**/incident*.md", "**/postmortem*.md"]
+    remediation: Document the incident response process.
+
+  - id: "6.7"
+    pillar: operations
+    title: Disaster recovery / backup policy
+    class: deterministic
+    tier: 1
+    severity: medium
+    gate: false
+    detector:
+      type: paths_any
+      globs: ["**/disaster-recovery*.md", "**/dr-plan*.md", "**/backup*.md"]
+    remediation: Document the DR plan with RTO and RPO targets.
+
+  - id: "6.8"
+    pillar: operations
+    title: Dependency lifecycle automation
+    class: deterministic
+    tier: 1
+    severity: medium
+    gate: false
+    detector:
+      type: paths_any
+      globs:
+        - .github/dependabot.yml
+        - .github/dependabot.yaml
+        - renovate.json
+        - .renovaterc
+        - .renovaterc.json
+        - .github/renovate.json
+    remediation: Enable Dependabot or Renovate.
+
+  - id: "6.9"
+    pillar: operations
+    title: Cost allocation tags
+    class: heuristic
+    tier: 2
+    severity: low
+    gate: false
+    detector:
+      type: search
+      query: "cost-center OR cost_center OR costCenter"
+      polarity: positive
+      applies_when: "4.5"
+    remediation: Tag cloud resources with project, env, owner and cost-center.
+
+  - id: "6.10"
+    pillar: operations
+    title: Deprecation policy
+    class: deep
+    tier: 3
+    severity: low
+    gate: false
+    detector:
+      type: manual
+      guidance: Requires reading deprecation notices in code, specs and changelog.
+    remediation: Mark deprecated APIs and schedule their removal.
+
+pillars:
+  scaffold:        {number: 1, title: Approved Scaffold}
+  standards:       {number: 2, title: Internal Engineering Standards}
+  mandatory_files: {number: 3, title: Mandatory Files and Documentation}
+  architecture:    {number: 4, title: Architecture Guidelines}
+  security:        {number: 5, title: Bancolombia Security Requirements}
+  operations:      {number: 6, title: Operational Practices}

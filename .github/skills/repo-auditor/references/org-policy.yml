@@ -1,0 +1,59 @@
+# Repo Auditor - organisation policy and audit scope.
+#
+# Scope is DECLARED here, never inferred by the model at runtime. Every repository in the
+# organisation is audited unless a rule below excludes it, and excluded repositories still
+# appear in the report under SKIPPED with their reason. An auditor needs to know that all
+# N repositories were considered, not "about N".
+
+org: octodemo
+
+scope:
+  # Archived repos cannot be remediated; auditing them wastes budget.
+  include_archived: false
+
+  # Forks are upstream code; the fork owner is not the compliance owner.
+  include_forks: false
+
+  # Repos untouched for longer than this are skipped as dormant. Set to 0 to disable.
+  stale_after_months: 24
+
+  # Shell-style globs matched against the repository name. Every exclusion must be
+  # justified here in writing - this is the only place a repo may leave scope.
+  exclude_repos:
+    - ".github"          # org profile repository, no application code
+    - "*-archive"
+    - "*-sandbox"
+
+  # When set, only repos carrying this topic are audited. Leave empty to audit everything.
+  # Useful for staged rollout: tag 100 repos, prove the pipeline, then clear this.
+  require_topic: ""
+
+execution:
+  # Default tier. 1 = deterministic only, 2 = + org-wide heuristics, 3 = + deep review.
+  tier: 2
+
+  # Number of shards for a full-org run. ~100 repos per shard keeps each job well inside
+  # the job time limit and lets a failed shard be retried on its own.
+  shards: 30
+
+  # Stop evaluating a repo once a gating check fails (see SKILL.md "Early exit").
+  early_exit: true
+
+  # Hard ceiling on API calls per repository in bulk mode. Exceeding it means the
+  # collection strategy has regressed to per-repo browsing.
+  max_api_calls_per_repo: 2
+
+output:
+  # GitHub caps issue bodies at 65,536 characters. Stay well under it.
+  issue_body_max_chars: 40000
+  worst_offenders_shown: 25
+
+  # Route per-repo detail to the offending repository instead of the central issue.
+  # Requires issues: write on the target repos.
+  per_repo_issues: false
+
+scaffolds:
+  source_repo: octodemo/Magero-ApprovedScaffolds
+  # Fetched ONCE per run into references/approved-scaffolds.json. Re-fetching per
+  # repository is forbidden - it multiplied to 3,000 identical calls at org scale.
+  cache_file: references/approved-scaffolds.json
